@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/sha1"
 	"fmt"
 	"log"
@@ -10,12 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kurin/blazer/b2"
-
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"gopkg.in/kothar/go-backblaze.v0"
 )
 
 type Content struct {
@@ -24,7 +18,9 @@ type Content struct {
 }
 
 var (
-	localfiles []Content
+	localfiles  []Content
+	imageBucket string
+	videoBucket string
 )
 
 type FileData struct {
@@ -35,44 +31,57 @@ type FileData struct {
 func main() {
 	id := os.Getenv("B2ID")
 	key := os.Getenv("B2SECRET")
-	dat, err := os.ReadFile("testfile.txt")
 
-	fmt.Printf("%+v\n", sha1Sum(dat))
-	ctx := context.Background()
-	// b2_authorize_account
-	b2, err := b2.NewClient(ctx, id, key)
+	b2cred, err := backblaze.NewB2(backblaze.Credentials{
+		KeyID:          id,
+		ApplicationKey: key,
+	})
+
+	if err != nil {
+		panic(err)
+	}
+	buckets, err := b2cred.ListBuckets()
+
 	if err != nil {
 		log.Fatalln(err)
 	}
-
-	buckets, err := b2.ListBuckets(ctx)
-	if err != nil {
-		log.Fatalln(err)
+	for _, b := range buckets {
+		fmt.Println(b.Name)
+		f, err := b.ListFileNamesWithPrefix("", 1000, "", "")
+		if err != nil {
+			fmt.Println(err.Error())
+		} else {
+			fmt.Println(f.Files)
+		}
 	}
 
-	fmt.Println(buckets[0].Name())
-
-}
-
-func connectTestB2() {
-	id := os.Getenv("B2ID")
-	key := os.Getenv("B2SECRET")
-	dat, err := os.ReadFile("testfile.txt")
-
-	fmt.Printf("%+v\n", sha1Sum(dat))
-	ctx := context.Background()
-	// b2_authorize_account
-	b2, err := b2.NewClient(ctx, id, key)
+	filesToUpload, err := fileWalk(os.Getenv("DATAPATH"))
 	if err != nil {
-		log.Fatalln(err)
+		panic(err)
 	}
 
-	buckets, err := b2.ListBuckets(ctx)
-	if err != nil {
-		log.Fatalln(err)
+	for _, f := range filesToUpload {
+		dat, err := os.ReadFile(f.Key)
+		if err != nil {
+			panic(err)
+		}
+		sha := sha1Sum(dat)
+		metadata := make(map[string]string)
+		fileReader, err := os.Open(f.Key)
+		if err != nil {
+			panic(err)
+		}
+		metadata["X-Bz-Content-Sha1"] = sha
+		metadata["large_file_sha1"] = sha
+		fmt.Println(metadata, f.Key)
+		if strings.HasSuffix(f.Key, "mov") {
+			buckets[1].UploadFile(filepath.Base(f.Key), metadata, fileReader)
+		} else {
+			buckets[0].UploadFile(filepath.Base(f.Key), metadata, fileReader)
+		}
+		fileReader.Close()
 	}
 
-	fmt.Println(buckets[0].Name())
 }
 
 func sha1Sum(data []byte) (sum string) {
@@ -229,76 +238,93 @@ func fileWalk(root string) ([]Content, error) {
 	return files, err
 }
 
-func sniff() {
-	s3id := os.Getenv("S3ID")
-	if s3id == "" {
-		panic("no s3 id")
-	}
-	s3key := os.Getenv("S3KEY")
-	if s3key == "" {
-		panic("no s3 key")
-	}
-	bucket := aws.String("photo-buc")
-	toUpload, err := fileWalk("/Users/exa3946/Documents/git/src/public/KowMangler/s3-synchorus")
-	if err != nil {
-		panic(err)
-	}
-	// region is required by aws package though not required by Ceph RGW.
-	s3Config := &aws.Config{
-		Credentials:      credentials.NewStaticCredentials(s3id, s3key, ""),
-		Endpoint:         aws.String("http://192.168.1.10:8000"),
-		Region:           aws.String("us-east-1"),
-		S3ForcePathStyle: aws.Bool(true),
-	}
-	newSession := session.New(s3Config)
+// Pricing Organized by API Calls
+// These details are provided for developers and programmers
 
-	s3Client := s3.New(newSession)
-	//buckets, err := s3Client.ListBuckets(&s3.ListBucketsInput{})
+// Transactions Class A
+// Costs: Free
 
-	// fmt.Printf("%+v\n", buckets)
-	// objects, err := s3Client.ListObjectsV2(&s3.ListObjectsV2Input{Bucket: buckets.Buckets[0].Name})
-	// fmt.Printf("%+v", objects)
-	// objectHead, err := s3Client.HeadObject(&s3.HeadObjectInput{Bucket: buckets.Buckets[0].Name, Key: objects.Contents[2].Key})
-	// fmt.Printf("%+v", objectHead)
-	// cparams := &s3.CreateBucketInput{
-	// 	Bucket: bucket, // Required
-	// }
-	// _, err = s3Client.CreateBucket(cparams)
-	// if err != nil {
-	// 	// Print if any error.
-	// 	fmt.Println(err.Error())
-	// 	return
-	// }
-	//fmt.Printf("Successfully created bucket %s\n", *bucket)
+// B2 Native API
+// S3 Compatible API
+// b2_cancel_large_file
+// Abort Multipart Upload
+// b2_delete_bucket
+// CreateMultipartUpload
+// b2_delete_file_version
+// CompleteMultipartUpload
+// b2_delete_key
+// DeleteBucket
+// b2_finish_large_file
+// DeleteObject
+// b2_get_upload_part_url
+// DeleteObjects
+// b2_get_upload_url
+// PutObject
+// b2_hide_file
+// PutObjectLegalHold
+// b2_start_large_file
+// PutObjectLockConfiguration
+// b2_update_file_legal_hold
+// PutObjectRetention
+// b2_update_file_retention
+// UploadPart
+// b2_upload_file
+// b2_upload_part
 
-	// Upload a new object "testfile.txt" with the string "S3 Compatible API"
-	for _, p := range toUpload {
-		uploadFileS3(s3Client, p.Key, bucket)
-		break
-	}
-}
+// Note: There is no charge to send data (upload) to Backblaze B2. Backblaze does not charge bandwidth fees and does not charge for b2_upload_file calls. Once uploaded, storage charges apply to all data after the first 10 Gigabytes in your account at the rate of $.005/GB/month.
 
-func uploadFileS3(s3Client *s3.S3, key string, bucket *string) {
-	returninf, err := s3Client.PutObject(&s3.PutObjectInput{
-		Body:   strings.NewReader("S3 Compatible API"),
-		Bucket: bucket,
-		Key:    &key,
-	})
-	if err != nil {
-		fmt.Printf("Failed to upload object %s/%s, %s\n", *bucket, key, err.Error())
-		return
-	}
-	fmt.Printf("Successfully uploaded key %s\n", key)
-	fmt.Printf("%+v", returninf)
+// Transactions Class B
+// Cost: The first 2,500 of these calls are free each day, then $0.004 per 10,000
 
-	//Get Object
-	_, err = s3Client.GetObject(&s3.GetObjectInput{
-		Bucket: bucket,
-		Key:    &key,
-	})
-	if err != nil {
-		fmt.Println("Failed to download file", err)
-		return
-	}
-	fmt.Printf("Successfully Downloaded key %s\n", key)
-}
+// B2 Native API
+// S3 Compatible API
+// b2_download_file_by_id
+// GetObject
+// b2_download_file_by_name
+// GetObjectLegalHold
+// b2_get_file_info
+// GetObjectLockConfiguration
+// GetObjectRetention
+// HeadObject
+
+// Note: In addition to the cost of each API call, there is a cost of downloading data specific to b2_download_file_by_id and b2_download_file_by_name. The first 1 GByte downloaded each day is free, then the amount over 1 GByte costs $0.01/GByte. Each day starts at 00:00 UTC.
+
+// Transactions Class C
+// Cost: The first 2,500 of these calls are free each day, then $0.004 per 1,000
+
+// B2 Native API
+// S3 Compatible API
+// b2_authorize_account
+// CopyObject (Put Object Copy)
+// b2_copy_file
+// CreateBucket
+// b2_copy_part
+// DeleteBucketCors
+// b2_create_bucket
+// DeleteBucketEncryption
+// b2_create_key
+// GetBucketAcl (List Objects)
+// b2_get_download_authorization
+// GetBucketCors
+// b2_list_buckets
+// GetBucketEncryption
+// b2_list_file_names
+// GetBucketLocation
+// b2_list_file_versions
+// GetBucketVersioning
+// b2_list_keys
+// GetObjectAcl
+// b2_list_parts
+// HeadBucket
+// b2_list_unfinished_large_files
+// ListBuckets
+// b2_update_bucket
+// ListMultipartUploads
+// ListObjectsV2
+// ListObjectVersions
+// ListParts
+// PutBucketAcl
+// PutBucketCors
+// PutBucketEncryption
+// PutObjectAcl
+// UploadPartCopy
